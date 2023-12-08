@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Self-hosted runners for Github Actions using ECS Fargate
+Parameters:
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Leave as latest for initial deployment. Then update stack to set the correct image tag (not URI).
+  NumRunners:
+    Type: Number
+    Default: 0
+    Description: Set to 0 for initial deployment. Then scale once the runner image is available in the repo.
+  VpcId:
+    Type: String
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  # Runners are dedicated to respositories or organizations
+  GithubRepo:
+    Description: organization/repository_name
+    Type: String
+  CPU:
+    Type: String
+    Description: CPU allocation for runner containers. Be sure to match with memory!
+    AllowedValues:
+      - .25 vCPU
+      - .5 vCPU
+      - 1 vCPU
+      - 2 vCPU
+      - 4 vCPU
+      - 8 vCPU
+  Memory:
+    Type: String
+    Description: Memory allocation for runner containers. Be sure to match with CPU!
+    AllowedValues:
+      - 0.5 GB
+      - 1 GB
+      - 2 GB
+      - 3 GB
+      - 4 GB
+      - 5 GB
+      - 6 GB
+      - 7 GB
+      - 8 GB
+      - 9 GB
+      - 10 GB
+      - 11 GB
+      - 12 GB
+      - 13 GB
+      - 14 GB
+      - 15 GB
+      - 16 GB
+  EcrRepoName:
+    Type: String
+    Description: "Name for the ECR repo that will be created to hold runner custom image"
+    AllowedPattern: "^(?=.{2,256}$)((?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*)$"
+
+Resources:
+  # Repository will hold the custom image for the runners which will include the runner script and any prerequisite tools required by steps in the worflows
+  GhaRunnersEcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: KMS
+      ImageTagMutability: IMMUTABLE
+      RepositoryName: !Ref "EcrRepoName"
+  
+  # This secret will hold the Github Personal Access Token (PAT) which the runners script will use to generate a runner registration token
+  GithubTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-GithubPAT"
+
+  # Used to execute the task within ECS
+  GhaRunnersExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: AllowReadSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Ref: GithubTokenSecret
+      RoleName: !Sub "${AWS::StackName}-Execution"
+  
+  # Used to grant outbound (egress) access ib 443
+  GhaRunnersTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Ref "AWS::StackName"
+      GroupName: !Ref "AWS::StackName"
+      VpcId:
+        Ref: VpcId
+  GhaRunnersTaskSecurityGroupEgress443:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      CidrIp: 0.0.0.0/0
+      FromPort: 443
+      GroupId:
+        Ref: GhaRunnersTaskSecurityGroup
+      IpProtocol: tcp
+      ToPort: 443
+
+  GhaRunnersTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref "AWS::StackName"
+      RetentionInDays: 30
+  
+  # Dedicated cluster for isolation
+  GhaEcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref "AWS::StackName"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+  
+  # This is the role the task will use when accessing AWS resources. Feel free to modify this to inlude policies (inline or managed) that grant least privilege access
+  GhaRunnersTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Condition:
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:*
+              StringEquals:
+                aws:SourceAccount:
+                  Fn::Sub: ${AWS::AccountId}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - arn:aws:s3:::dev-web-assets-393419659647-use2
+                  - arn:aws:s3:::dev-web-assets-393419659647-use2/*
+      RoleName: !Sub "${AWS::StackName}-Task"
+  
+  # Defines the task and container for the runners
+  GhaRunnersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: runners
+          Image:
+            Fn::Join:
+              - ':'
+              - - Fn::GetAtt: GhaRunnersEcrRepo.RepositoryUri
+                - Ref: ImageTag
+          Essential: true
+          Environment:
+            - Name: ENVIRONMENT
+              Value: cicd
+            - Name: REPO
+              Value:
+                Ref: GithubRepo
+          Secrets:
+            - Name: GITHUB_TOKEN
+              ValueFrom:
+                Ref: GithubTokenSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref "AWS::StackName"
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-stream-prefix: runners
+      Cpu:
+        Ref: CPU
+      ExecutionRoleArn:
+        Fn::GetAtt: GhaRunnersExecutionRole.Arn
+      Family: !Ref "AWS::StackName"
+      Memory:
+        Ref: Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn:
+        Fn::GetAtt: GhaRunnersTaskRole.Arn
+  
+  # The service is used to maintain a number of runners. You can scale the NumRunners parameter to something that efficiently supports the cadence of pull requests for your repository
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster:
+        Ref: GhaEcsCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount:
+        Ref: NumRunners
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            Ref: SubnetIds
+          SecurityGroups:
+            - Ref: GhaRunnersTaskSecurityGroup
+      ServiceName: !Ref "AWS::StackName"
+      TaskDefinition:
+        Ref: GhaRunnersTaskDefinition
+Outputs:
+  GhaRunnersEcrRepoUri:
+    Value:
+      Fn::GetAtt: GhaRunnersEcrRepo.RepositoryUri
+  GithubTokenSecretArn:
+    Value:
+      Ref: GithubTokenSecret
